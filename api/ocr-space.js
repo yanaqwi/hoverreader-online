@@ -1,5 +1,4 @@
-// api/ocr-space.js
-// Vercel Serverless Function (Edge): OCR.Space proxy with engine fallback
+// HoverReader API — v0.3.2 (ocr-space)
 export const config = { runtime: 'edge' };
 
 export default async function handler(req) {
@@ -19,7 +18,6 @@ export default async function handler(req) {
       return new Response(JSON.stringify({ error: 'Server missing OCRSPACE_API_KEY' }), { status: 500, headers: cors() });
     }
 
-    // Helper to call OCR.Space with a specific engine
     async function callEngine(engine) {
       const form = new URLSearchParams();
       form.set('apikey', apiKey);
@@ -27,7 +25,7 @@ export default async function handler(req) {
       form.set('OCREngine', String(engine)); // '1' or '2'
       form.set('language', language);
       form.set('detectOrientation', 'true');
-      form.set('scale', 'true'); // recommended for better results on scans
+      form.set('scale', 'true');
       form.set('isTable', 'false');
       form.set('base64Image', base64Image);
 
@@ -40,13 +38,11 @@ export default async function handler(req) {
       return j;
     }
 
-    // Try Engine 2, then Engine 1 if needed
     let first = await callEngine(2);
     let overlayCount = countOverlay(first);
     if (overlayCount === 0) {
       const second = await callEngine(1);
       const overlayCount2 = countOverlay(second);
-      // Prefer the one that returns more overlay words
       if (overlayCount2 > overlayCount) {
         second._note = 'Used OCR Engine 1 (more overlay words).';
         return new Response(JSON.stringify(second), { status: 200, headers: cors() });
