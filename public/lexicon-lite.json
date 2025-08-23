@@ -1,0 +1,73 @@
+[
+  {
+    "form": "البلاغة",
+    "lemma": "بلاغة",
+    "root": "ب-ل-غ",
+    "glosses": [
+      "eloquence",
+      "rhetoric"
+    ]
+  },
+  {
+    "form": "الفصاحة",
+    "lemma": "فصاحة",
+    "root": "ف-ص-ح",
+    "glosses": [
+      "clarity of speech",
+      "eloquence"
+    ]
+  },
+  {
+    "form": "الأسلوب",
+    "lemma": "أسلوب",
+    "root": "س-ل-ب",
+    "glosses": [
+      "style",
+      "manner"
+    ]
+  },
+  {
+    "form": "كلام",
+    "lemma": "كلام",
+    "root": "ك-ل-م",
+    "glosses": [
+      "speech",
+      "discourse"
+    ]
+  },
+  {
+    "form": "معنى",
+    "lemma": "معنى",
+    "root": "ع-ن-ي",
+    "glosses": [
+      "meaning",
+      "sense"
+    ]
+  },
+  {
+    "form": "وضوح",
+    "lemma": "وضوح",
+    "root": "و-ض-ح",
+    "glosses": [
+      "clarity"
+    ]
+  },
+  {
+    "form": "سهولة",
+    "lemma": "سهولة",
+    "root": "س-ه-ل",
+    "glosses": [
+      "ease",
+      "facility"
+    ]
+  },
+  {
+    "form": "اللفظ",
+    "lemma": "لفظ",
+    "root": "ل-ف-ظ",
+    "glosses": [
+      "utterance",
+      "wording"
+    ]
+  }
+]
