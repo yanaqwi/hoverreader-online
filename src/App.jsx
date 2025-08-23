@@ -1,4 +1,4 @@
-// src/App.jsx
+// HoverReader Frontend — v0.3.2
 import React, { useEffect, useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import PdfJsWorker from "pdfjs-dist/build/pdf.worker?worker";
@@ -16,7 +16,6 @@ class WordCache {
   get(key) {
     if (!this.map.has(key)) return null;
     const val = this.map.get(key);
-    // bump recency
     this.map.delete(key);
     this.map.set(key, val);
     return val;
@@ -25,7 +24,6 @@ class WordCache {
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, val);
     if (this.map.size > this.limit) {
-      // delete oldest (first)
       const first = this.map.keys().next().value;
       this.map.delete(first);
     }
@@ -144,9 +142,7 @@ function safeIsArabicString(s = "") {
   if (!s) return false;
   try {
     const ok =
-      s
-        .split("")
-        .filter((c) => /\p{Script=Arabic}/u.test(c)).length / s.length >= 0.6;
+      s.split("").filter((c) => /\p{Script=Arabic}/u.test(c)).length / s.length >= 0.6;
     return ok;
   } catch {
     const arabic = (s.match(/[\u0600-\u06FF]/g) || []).length;
@@ -175,12 +171,11 @@ function layoutWordsFromTextItems(items, viewport) {
   for (const it of items) {
     const str = it.str || "";
     if (!str.trim()) continue;
-    if (!safeIsArabicString(str)) continue; // skip glyph junk
+    if (!safeIsArabicString(str)) continue;
 
     const width = it.width * viewport.scale;
     const t = pdfjsLib.Util.transform(vT, it.transform); // [a,b,c,d,e,f]
-    const x = t[4],
-      y = t[5];
+    const x = t[4], y = t[5];
     const fontHeight = Math.hypot(t[1], t[3]) || 12;
     const h = fontHeight;
 
@@ -270,7 +265,7 @@ async function getWordTooltip(arWord, lexicon) {
     WORD_CACHE.set(arWord, tip);
     return tip;
   } catch {
-    return arWord; // fall back to showing the Arabic if translation failed
+    return arWord; // fallback to Arabic if translation fails
   }
 }
 
@@ -297,18 +292,16 @@ function PageOverlay({
       return;
     }
 
-    // If same word as last shown, keep tooltip position only
     if (lastHoverWord.current === word && hover?.text) {
-      setHover({ text: hover.text }); // keep showing
+      setHover({ text: hover.text });
       return;
     }
 
-    // Show immediate fallback (Arabic) while we resolve English
+    // Immediate placeholder while we fetch EN
     setHover({ text: word });
     lastHoverWord.current = word;
 
     const tip = await getWordTooltip(word, lexicon);
-    // Still hovering same token?
     if (lastHoverWord.current === word) {
       setHover({ text: tip });
     }
@@ -413,7 +406,6 @@ export default function App() {
             mode = "none";
             reason = "embedded-glyphs";
           } else {
-            // Layout word-ish boxes
             words = layoutWordsFromTextItems(items, viewport);
             if (words.length < 3) {
               mode = "none";
@@ -461,8 +453,7 @@ export default function App() {
         if (testBoxes) {
           const synth = [];
           for (let k = 0; k < 6; k++) {
-            const w = 120,
-              h = 36;
+            const w = 120, h = 36;
             const left = 20 + k * 24;
             const top = 50 + k * 28;
             synth.push({
