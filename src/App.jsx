@@ -20,7 +20,7 @@ const STYLES = {
     position: "absolute",
     inset: 0,
     zIndex: 5,
-    pointerEvents: "auto", // IMPORTANT: interactions must flow through
+    pointerEvents: "auto", // MUST be 'auto' so hover/click works
   },
   overlayWord: {
     position: "absolute",
@@ -28,7 +28,7 @@ const STYLES = {
     borderRadius: 4,
     pointerEvents: "auto",
     cursor: "pointer",
-    background: "rgba(147,197,253,.18)",
+    background: "rgba(147,197,253,.16)",
     outlineOffset: 0,
     transition: "outline 120ms ease, background 120ms ease",
   },
@@ -113,18 +113,16 @@ function normalizeArabic(s = "") {
     .replace(/ـ/g, "")
     .replace(/[^\u0600-\u06FF\s]/g, "");
 }
-// Safe Arabic detection (works even if \p{Script=Arabic} is unsupported)
+// Safe Arabic detection (works even if \p{Script=Arabic} unsupported)
 function safeIsArabicString(s = "") {
   if (!s) return false;
   try {
-    // Newer engines
     const ok =
       s
         .split("")
         .filter((c) => /\p{Script=Arabic}/u.test(c)).length / s.length >= 0.6;
     return ok;
   } catch {
-    // Fallback: BMP range
     const arabic = (s.match(/[\u0600-\u06FF]/g) || []).length;
     return arabic / s.length >= 0.6;
   }
@@ -135,8 +133,7 @@ async function pdfToPageImage(page, scale = 1.6) {
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
-  await page.render({ canvasContext: canvas.getContext("2d"), viewport })
-    .promise;
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
   return {
     dataUrl: canvas.toDataURL("image/jpeg", 0.9),
     width: canvas.width,
@@ -152,9 +149,7 @@ function layoutWordsFromTextItems(items, viewport) {
   for (const it of items) {
     const str = it.str || "";
     if (!str.trim()) continue;
-
-    // Skip gibberish/non-Arabic
-    if (!safeIsArabicString(str)) continue;
+    if (!safeIsArabicString(str)) continue; // skip glyph junk
 
     const width = it.width * viewport.scale;
     const t = pdfjsLib.Util.transform(vT, it.transform); // [a,b,c,d,e,f]
@@ -163,23 +158,21 @@ function layoutWordsFromTextItems(items, viewport) {
     const fontHeight = Math.hypot(t[1], t[3]) || 12;
     const h = fontHeight;
 
-    // Split into rough words
     const clean = str.replace(/\s+/g, " ").trim();
     const parts = clean.split(" ").filter(Boolean);
     const totalChars = clean.replace(/\s+/g, "").length || 1;
     let cursorX = x;
     for (const p of parts) {
       const chars = p.replace(/\s+/g, "").length;
-      const w = width * (chars / totalChars);
+      const w = Math.max(3, width * (chars / totalChars)); // ensure clickable width >=3px
       out.push({
         WordText: p,
         Left: cursorX,
         Top: y - h, // baseline → top
         Width: w,
-        Height: h * 1.15,
+        Height: Math.max(10, h * 1.15), // ensure min height so it's clickable
         lineText: str,
       });
-      // crude spacing proportional to character width
       cursorX += w + width * (1 / totalChars);
     }
   }
@@ -191,7 +184,6 @@ async function extractTextOverlay(page, scale = 1.6) {
   const text = await page.getTextContent();
   const items = text.items || [];
 
-  // If text items exist but <20% are Arabic → treat as unusable
   const arabicItems = items.filter((it) => safeIsArabicString(it.str || ""));
   if (items.length > 0 && arabicItems.length / items.length < 0.2) {
     return { img, words: [], mode: "none", reason: "embedded-glyphs" };
@@ -212,7 +204,6 @@ async function ocrPageViaServerless(base64Image, language = "ara") {
   return await res.json();
 }
 
-// ---------- overlay page ----------
 function PageOverlay({
   img,
   overlay,
@@ -269,10 +260,9 @@ function PageOverlay({
                 top: w.Top,
                 width: w.Width,
                 height: w.Height,
-                // If user hides boxes, keep them hit-testable but less visible
                 background: showBoxes
-                  ? "rgba(147,197,253,.18)"
-                  : "rgba(147,197,253,.08)",
+                  ? "rgba(147,197,253,.16)"
+                  : "rgba(147,197,253,.06)",
               }}
               title={tipText}
             />
@@ -285,13 +275,14 @@ function PageOverlay({
   );
 }
 
-// ---------- main ----------
 export default function App() {
   const [pages, setPages] = useState([]); // [{img, overlay, mode, reason, boxCount}]
   const [activeWord, setActiveWord] = useState(null);
   const [busy, setBusy] = useState(false);
   const [lang, setLang] = useState("ara");
   const [showBoxes, setShowBoxes] = useState(true);
+  const [forceOcr, setForceOcr] = useState(false); // DEBUG: force OCR path
+  const [testBoxes, setTestBoxes] = useState(false); // DEBUG: draw synthetic boxes
   const lexicon = useLexicon();
 
   async function handleFile(f) {
@@ -306,36 +297,107 @@ export default function App() {
       for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
 
-        // Try TEXT first
-        let { img, words, mode, reason } = await extractTextOverlay(page, 1.6);
+        // Render page to image
+        const { viewport, ...img } = await (async () => {
+          const vpPage = await pdf.getPage(i);
+          const viewport = vpPage.getViewport({ scale: 1.6 });
+          const canvas = document.createElement("canvas");
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          await vpPage.render({
+            canvasContext: canvas.getContext("2d"),
+            viewport,
+          }).promise;
+          return {
+            dataUrl: canvas.toDataURL("image/jpeg", 0.9),
+            width: canvas.width,
+            height: canvas.height,
+            viewport,
+          };
+        })();
+
+        let words = [];
+        let mode = "text";
+        let reason = "";
+
+        if (!forceOcr) {
+          // Try TEXT extraction first
+          const text = await page.getTextContent();
+          const items = text.items || [];
+
+          const arabicItems = items.filter((it) =>
+            safeIsArabicString(it.str || "")
+          );
+          if (items.length > 0 && arabicItems.length / items.length < 0.2) {
+            mode = "none";
+            reason = "embedded-glyphs";
+          } else {
+            // Layout word-ish boxes
+            words = layoutWordsFromTextItems(items, viewport);
+            if (words.length < 3) {
+              mode = "none";
+              reason = "no-words";
+            }
+          }
+        } else {
+          mode = "none";
+          reason = "forced-ocr";
+        }
 
         // Fallback to OCR when needed
         if (mode !== "text" || words.length === 0) {
-          const ocr = await ocrPageViaServerless(img.dataUrl, lang);
-          const pr = ocr?.ParsedResults?.[0];
-          const ocrWords = [];
-          if (pr?.TextOverlay?.Lines) {
-            for (const line of pr.TextOverlay.Lines) {
-              const lineText =
-                line.LineText ||
-                (line.Words || []).map((w) => w.WordText).join(" ");
-              for (const w of line.Words || []) {
-                // OCR.space coords match the input image size
-                ocrWords.push({ ...w, lineText });
+          try {
+            const ocr = await ocrPageViaServerless(img.dataUrl, lang);
+            const pr = ocr?.ParsedResults?.[0];
+            const ocrWords = [];
+            if (pr?.TextOverlay?.Lines) {
+              for (const line of pr.TextOverlay.Lines) {
+                const lineText =
+                  line.LineText ||
+                  (line.Words || []).map((w) => w.WordText).join(" ");
+                for (const w of line.Words || []) {
+                  ocrWords.push({ ...w, lineText });
+                }
               }
             }
-          }
-          words = ocrWords;
-          mode = "ocr";
-          if (reason === "embedded-glyphs") {
-            reason = "Embedded text wasn’t Unicode Arabic; OCR used.";
-          } else if (!reason) {
-            reason = "No usable text layer; OCR used.";
+            words = ocrWords;
+            mode = "ocr";
+            if (reason === "embedded-glyphs") {
+              reason = "Embedded text wasn’t Unicode Arabic; OCR used.";
+            } else if (reason === "forced-ocr") {
+              reason = "Force OCR enabled.";
+            } else {
+              reason = "No usable text layer; OCR used.";
+            }
+          } catch (e) {
+            words = [];
+            mode = "ocr";
+            reason = "OCR error: " + e.message;
           }
         }
 
+        // DEBUG: draw synthetic clickable boxes to prove overlay works
+        if (testBoxes) {
+          const synth = [];
+          for (let k = 0; k < 6; k++) {
+            const w = 120,
+              h = 36;
+            const left = 20 + k * 24;
+            const top = 50 + k * 28;
+            synth.push({
+              WordText: "TEST",
+              Left: left,
+              Top: top,
+              Width: w,
+              Height: h,
+              lineText: "Synthetic test box",
+            });
+          }
+          words = words.concat(synth);
+        }
+
         out.push({
-          img,
+          img: { dataUrl: img.dataUrl, width: img.width, height: img.height },
           overlay: words,
           mode,
           reason,
@@ -430,6 +492,22 @@ export default function App() {
               />
               Show boxes
             </label>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input
+                type="checkbox"
+                checked={forceOcr}
+                onChange={(e) => setForceOcr(e.target.checked)}
+              />
+              Force OCR
+            </label>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input
+                type="checkbox"
+                checked={testBoxes}
+                onChange={(e) => setTestBoxes(e.target.checked)}
+              />
+              Draw test boxes
+            </label>
             {busy ? <span>Processing…</span> : <span>Ready</span>}
           </div>
 
@@ -508,13 +586,8 @@ export default function App() {
                 Page {i + 1}
                 <span style={STYLES.badge}>mode: {p.mode}</span>
                 <span style={STYLES.badge}>boxes: {p.boxCount}</span>
-                {p.mode === "ocr" && p.reason && (
+                {p.reason && (
                   <span style={STYLES.warning}>• {p.reason}</span>
-                )}
-                {p.boxCount === 0 && (
-                  <span style={STYLES.warning}>
-                    • No boxes found on this page.
-                  </span>
                 )}
               </div>
               <PageOverlay
