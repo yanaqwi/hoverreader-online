@@ -4,13 +4,12 @@ import * as pdfjsLib from "pdfjs-dist";
 import PdfJsWorker from "pdfjs-dist/build/pdf.worker?worker";
 pdfjsLib.GlobalWorkerOptions.workerPort = new PdfJsWorker();
 
-// Serverless API routes (already in your repo)
 const API_OCR = "/api/ocr-space";
 const API_TRANSLATE = "/api/translate";
 
 const STYLES = {
   page: { position: "relative", margin: "0 auto", boxShadow: "0 10px 30px rgba(0,0,0,.35)", borderRadius: 12, overflow: "hidden", background: "#111" },
-  overlayLayer: { position: "absolute", inset: 0, zIndex: 5, pointerEvents: "none" },           // layer itself ignores events
+  overlayLayer: { position: "absolute", inset: 0, zIndex: 5, pointerEvents: "none" },
   overlayWord: { position: "absolute", lineHeight: 1.4, padding: "0 2px", borderRadius: 4, pointerEvents: "auto", cursor: "pointer", background: "rgba(147,197,253,.18)" },
   tip: { position: "fixed", bottom: "auto", transform: "translate(-50%, -120%)", background: "#111", color: "#fff", padding: "6px 8px", borderRadius: 8, whiteSpace: "nowrap", fontSize: 12, zIndex: 50, pointerEvents: "none" },
   sidebar: { position: "sticky", top: 16, padding: 12, border: "1px solid #1f2937", borderRadius: 12, background: "rgba(17,17,17,.6)" },
@@ -18,6 +17,7 @@ const STYLES = {
   input: { padding: "8px", borderRadius: 10, border: "1px solid #333", background: "#0b0c10", color: "#e5e7eb", minWidth: 180 },
 };
 
+// ---------- helpers ----------
 function useLexicon() {
   const [map, setMap] = useState({});
   useEffect(() => {
@@ -37,6 +37,23 @@ function useLexicon() {
 function stripDiacritics(s) {
   return (s || "").replace(/[\u0610-\u061A\u064B-\u065F\u06D6-\u06ED]/g, "");
 }
+function normalizeArabic(s="") {
+  // normalize alef/yaa/ta marbuta/hamza forms & remove tatweel/punct
+  return s
+    .replace(/[إأآا]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ة/g, "ه")
+    .replace(/[ؤئ]/g, "ء")
+    .replace(/ـ/g, "")
+    .replace(/[^\u0600-\u06FF\s]/g, "");
+}
+function isArabicString(s="") {
+  // consider it Arabic if ≥60% of chars are Arabic range
+  const chars = [...s];
+  if (chars.length === 0) return false;
+  const arabic = chars.filter(c => /\p{Script=Arabic}/u.test(c)).length;
+  return arabic / chars.length >= 0.6;
+}
 
 async function pdfToPageImage(page, scale=1.6) {
   const viewport = page.getViewport({ scale });
@@ -47,41 +64,38 @@ async function pdfToPageImage(page, scale=1.6) {
   return { dataUrl: canvas.toDataURL("image/jpeg", 0.9), width: canvas.width, height: canvas.height, viewport };
 }
 
-// --- TEXT MODE (no OCR): build per-word-ish overlays from pdf.js textContent ---
+// Build word-ish boxes from text items (text mode)
 function layoutWordsFromTextItems(items, viewport) {
-  // Each item is a text chunk; we split by spaces to approximate per-word boxes.
-  // Compute device-space transform using pdf.js utilities.
   const out = [];
   const vT = viewport.transform;
   for (const it of items) {
     const str = it.str || "";
     if (!str.trim()) continue;
 
-    const width = it.width * viewport.scale; // approx
-    const t = pdfjsLib.Util.transform(vT, it.transform); // [a,b,c,d,e,f]
+    // If this line looks non-Arabic (e.g., gibberish glyphs), skip it
+    if (!isArabicString(str)) continue;
+
+    const width = it.width * viewport.scale;
+    const t = pdfjsLib.Util.transform(vT, it.transform);
     let x = t[4], y = t[5];
-    // pdf.js y is baseline; estimate height from transform
     const fontHeight = Math.hypot(t[1], t[3]) || 12;
     const h = fontHeight;
 
-    // Split by whitespace for word-ish boxes
-    const parts = str.split(/\s+/).filter(Boolean);
+    const pieces = str.split(/\s+/).filter(Boolean);
     const totalChars = str.replace(/\s+/g, "").length || 1;
     let cursorX = x;
-    let consumed = 0;
-    for (const p of parts) {
+    for (const p of pieces) {
       const chars = p.replace(/\s+/g, "").length;
       const w = width * (chars / totalChars);
       out.push({
         WordText: p,
         Left: cursorX,
-        Top: y - h,        // y is baseline → move up by height
+        Top: y - h,
         Width: w,
-        Height: h * 1.1,   // pad a bit
+        Height: h * 1.1,
         lineText: str
       });
-      cursorX += w + (width * (1 / totalChars)); // small space
-      consumed += chars;
+      cursorX += w + (width * (1 / totalChars));
     }
   }
   return out;
@@ -91,14 +105,18 @@ async function extractTextOverlay(page, scale=1.6) {
   const { viewport, ...img } = await pdfToPageImage(page, scale);
   const text = await page.getTextContent();
   const items = text.items || [];
-  if (items.length >= 3) {
-    const words = layoutWordsFromTextItems(items, viewport);
-    return { img, words, mode: "text" };
+
+  // If text items exist but < 20% of them are Arabic → treat as unusable → let caller OCR
+  const arabicItems = items.filter(it => isArabicString(it.str || ""));
+  if (items.length > 0 && arabicItems.length / items.length < 0.2) {
+    return { img, words: [], mode: "none" };
   }
-  return { img, words: [], mode: "none" }; // let caller decide OCR fallback
+
+  const words = layoutWordsFromTextItems(items, viewport);
+  if (words.length >= 3) return { img, words, mode: "text" };
+  return { img, words: [], mode: "none" };
 }
 
-// --- OCR fallback (for scanned pages) ---
 async function ocrPageViaServerless(base64Image, language="ara") {
   const res = await fetch(API_OCR, {
     method: "POST",
@@ -108,6 +126,7 @@ async function ocrPageViaServerless(base64Image, language="ara") {
   if (!res.ok) throw new Error("OCR failed");
   return await res.json();
 }
+// --------------------------------
 
 function PageOverlay({ img, overlay, lexicon, onWordClick, onWordDblClick }) {
   const [hover, setHover] = useState(null);
@@ -119,29 +138,41 @@ function PageOverlay({ img, overlay, lexicon, onWordClick, onWordDblClick }) {
       <div style={STYLES.overlayLayer}>
         {overlay?.map((w, idx) => {
           const key = `${idx}-${w.WordText}-${w.Left}-${w.Top}`;
-          // Try raw form, then diacritic-stripped
-          const gloss = lexicon[w.WordText] || lexicon[stripDiacritics(w.WordText)];
+          // Try to find a gloss with normalization
+          const formsToTry = [
+            w.WordText,
+            stripDiacritics(w.WordText),
+            normalizeArabic(w.WordText),
+            normalizeArabic(stripDiacritics(w.WordText))
+          ];
+          let entry = null;
+          for (const f of formsToTry) {
+            if (lexicon[f]) { entry = lexicon[f]; break; }
+          }
+          // Always show a tooltip with at least the word itself
+          const tipText = entry ? (entry.glosses||[]).join(", ") : w.WordText;
+
           return (
             <span
               key={key}
               dir="rtl"
-              onMouseEnter={(e)=>{ setHover({text:w.WordText, gloss}); setPos({x:e.clientX, y:e.clientY}); }}
+              onMouseEnter={(e)=>{ setHover({text: tipText}); setPos({x:e.clientX, y:e.clientY}); }}
               onMouseLeave={()=>setHover(null)}
-              onClick={()=> onWordClick?.(w, gloss) }
+              onClick={()=> onWordClick?.(w, entry) }
               onDoubleClick={()=> onWordDblClick?.(w) }
               style={{
                 ...STYLES.overlayWord,
                 left: w.Left, top: w.Top, width: w.Width, height: w.Height
               }}
-              title={gloss ? (gloss.glosses||[]).join(", ") : ""}
+              title={tipText}
             />
           );
         })}
       </div>
 
-      {hover && hover.gloss && (
+      {hover && (
         <div style={{...STYLES.tip, left: pos.x, top: pos.y}}>
-          {(hover.gloss.glosses||[]).join(", ")}
+          {hover.text}
         </div>
       )}
     </div>
@@ -165,10 +196,10 @@ export default function App() {
       for (let i=1; i<=pdf.numPages; i++) {
         const page = await pdf.getPage(i);
 
-        // 1) Try TEXT MODE first
+        // Attempt TEXT extraction first
         let { img, words, mode } = await extractTextOverlay(page, 1.6);
 
-        // 2) If no words, fallback to OCR
+        // If items exist but aren’t Arabic, or no words found → OCR fallback
         if (mode !== "text" || words.length === 0) {
           const ocr = await ocrPageViaServerless(img.dataUrl, lang);
           const pr = ocr?.ParsedResults?.[0];
@@ -177,7 +208,6 @@ export default function App() {
             for (const line of pr.TextOverlay.Lines) {
               const lineText = line.LineText || (line.Words||[]).map(w=>w.WordText).join(" ");
               for (const w of (line.Words||[])) {
-                // OCR.space outputs px aligned to the image we sent
                 ocrWords.push({ ...w, lineText });
               }
             }
@@ -204,7 +234,10 @@ export default function App() {
     });
     if (!res.ok) throw new Error("Translate failed");
     const j = await res.json();
-    return j?.translatedText || "";
+    // Handle both {translatedText} and array forms
+    if (typeof j?.translatedText === "string") return j.translatedText;
+    if (Array.isArray(j) && j[0]?.translatedText) return j[0].translatedText;
+    return "";
   }
 
   async function onWordClick(w, gloss) {
@@ -233,7 +266,7 @@ export default function App() {
           </div>
           <div style={STYLES.sidebar}>
             <h3 style={{ marginTop: 0 }}>Details</h3>
-            {!activeWord && <div>Hover a word for gloss. Click for root/lemma. Double-click a line for translation.</div>}
+            {!activeWord && <div>Hover a word for gloss (or the word itself). Click for root/lemma. Double-click the line for translation.</div>}
             {activeWord && (
               <div>
                 <div style={{fontSize:18, marginBottom:8}} dir="rtl">{activeWord.w?.WordText}</div>
@@ -282,7 +315,7 @@ export default function App() {
             </div>
           ))}
         </div>
-        <div /> {/* spacer */}
+        <div />
       </div>
     </div>
   );
