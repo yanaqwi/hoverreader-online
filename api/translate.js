@@ -1,17 +1,11 @@
-// HoverReader API — v0.3.2 (translate)
+// HoverReader API — v0.4.0 (translate with CORS preflight)
 export const config = { runtime: 'edge' };
 
-/**
- * Translation proxy with two free backends:
- * 1) LibreTranslate (set TRANSLATE_URL env, e.g. https://libretranslate.de/translate)
- * 2) MyMemory fallback (public, rate-limited)
- *
- * Env:
- * - TRANSLATE_URL (optional) — if provided, we use LibreTranslate-compatible API
- * - TRANSLATE_API_KEY (optional) — if your LibreTranslate requires a key
- */
 export default async function handler(req) {
   try {
+    if (req.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: cors() });
+    }
     if (req.method !== 'POST') {
       return new Response(JSON.stringify({ error: 'POST only' }), { status: 405, headers: cors() });
     }
@@ -24,26 +18,15 @@ export default async function handler(req) {
       return new Response(JSON.stringify({ error: 'Missing q' }), { status: 400, headers: cors() });
     }
 
-    // Try LibreTranslate-compatible endpoint first if configured
     const LT = process.env.TRANSLATE_URL;
     if (LT) {
       try {
-        const payload = {
-          q,
-          source,
-          target,
-          format: 'text',
-        };
+        const payload = { q, source, target, format: 'text' };
         const headers = { 'content-type': 'application/json' };
         const key = process.env.TRANSLATE_API_KEY;
         if (key) headers['x-api-key'] = key;
 
-        const r = await fetch(LT, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(payload),
-        });
-
+        const r = await fetch(LT, { method: 'POST', headers, body: JSON.stringify(payload) });
         if (r.ok) {
           const j = await r.json();
           const translatedText = j?.translatedText || j?.data?.translatedText || '';
@@ -52,17 +35,16 @@ export default async function handler(req) {
           }
         }
       } catch {
-        // fall through to MyMemory
+        // fall through
       }
     }
 
-    // Fallback: MyMemory (public)
     const url = new URL('https://api.mymemory.translated.net/get');
     url.searchParams.set('q', q);
     url.searchParams.set('langpair', `${mapLang(source) || 'auto'}|${mapLang(target) || 'en'}`);
 
     const resp = await fetch(url.toString());
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
     const translatedText = data?.responseData?.translatedText || '';
 
     return new Response(JSON.stringify({ translatedText }), { status: 200, headers: cors() });
@@ -73,7 +55,6 @@ export default async function handler(req) {
 }
 
 function mapLang(l) {
-  // minimal mapper for common tags to MyMemory format
   if (!l || l === 'auto') return 'auto';
   if (l.startsWith('ar')) return 'ar';
   if (l.startsWith('en')) return 'en';
