@@ -1,8 +1,24 @@
-// HoverReader Frontend — v0.3.2
+// HoverReader Frontend — v0.4.0
+// - Fixes: visible per-page progress, timeouts, and safer PDF text extraction
+// - Adds: .DOCX support via client-side rendering (docx-preview)
+// - Hover: Arabic→English tooltip (lexicon→cache→/api/translate)
+// - Click: shows line in sidebar; Double-click: line translation
+// - UI: page cap, force OCR, draw test boxes, error surfacing
+
 import React, { useEffect, useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import PdfJsWorker from "pdfjs-dist/build/pdf.worker?worker";
 pdfjsLib.GlobalWorkerOptions.workerPort = new PdfJsWorker();
+
+// Lazy import for DOCX rendering (docx-preview)
+let renderDocxAsync = null;
+async function loadDocxPreview() {
+  if (!renderDocxAsync) {
+    const mod = await import("docx-preview");
+    renderDocxAsync = mod.renderAsync;
+  }
+  return renderDocxAsync;
+}
 
 const API_OCR = "/api/ocr-space";
 const API_TRANSLATE = "/api/translate";
@@ -105,9 +121,33 @@ const STYLES = {
     background: "#7c2d12",
     color: "#fde68a",
   },
+  error: {
+    background: "#7f1d1d",
+    color: "#fecaca",
+    padding: "8px 10px",
+    borderRadius: 8,
+    marginTop: 8,
+    border: "1px solid #ef4444",
+  },
+  docxShell: {
+    background: "#111",
+    padding: 16,
+    borderRadius: 12,
+    border: "1px solid #1f2937",
+  },
+  docxPage: {
+    margin: "16px auto",
+    padding: "24px 28px",
+    background: "#fff",
+    color: "#000",
+    width: 820,
+    boxShadow: "0 10px 30px rgba(0,0,0,.35)",
+    borderRadius: 12,
+    direction: "rtl",
+  },
 };
 
-// ---------- lexicon (tiny demo) ----------
+// ------- Lexicon (tiny demo) -------
 function useLexicon() {
   const [map, setMap] = useState({});
   useEffect(() => {
@@ -150,6 +190,44 @@ function safeIsArabicString(s = "") {
   }
 }
 
+async function translateAPI(text, source = "ar", target = "en") {
+  const r = await fetch(API_TRANSLATE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ q: text, source, target }),
+  });
+  if (!r.ok) throw new Error("Translate failed");
+  const j = await r.json();
+  if (typeof j?.translatedText === "string") return j.translatedText;
+  if (Array.isArray(j) && j[0]?.translatedText) return j[0].translatedText;
+  return "";
+}
+
+async function getWordTooltip(arWord, lexicon) {
+  if (!arWord || !arWord.trim()) return "";
+  const candidates = [
+    arWord,
+    stripDiacritics(arWord),
+    normalizeArabic(arWord),
+    normalizeArabic(stripDiacritics(arWord)),
+  ];
+  for (const c of candidates) {
+    const entry = lexicon[c];
+    if (entry) return (entry.glosses || []).join(", ");
+  }
+  const cached = WORD_CACHE.get(arWord);
+  if (cached) return cached;
+  try {
+    const en = await translateAPI(arWord, "ar", "en");
+    const tip = en || arWord;
+    WORD_CACHE.set(arWord, tip);
+    return tip;
+  } catch {
+    return arWord;
+  }
+}
+
+// ---------- PDF helpers ----------
 async function pdfToPageImage(page, scale = 1.6) {
   const viewport = page.getViewport({ scale });
   const canvas = document.createElement("canvas");
@@ -164,7 +242,6 @@ async function pdfToPageImage(page, scale = 1.6) {
   };
 }
 
-// Build word-ish boxes from text items (text mode)
 function layoutWordsFromTextItems(items, viewport) {
   const out = [];
   const vT = viewport.transform;
@@ -174,7 +251,7 @@ function layoutWordsFromTextItems(items, viewport) {
     if (!safeIsArabicString(str)) continue;
 
     const width = it.width * viewport.scale;
-    const t = pdfjsLib.Util.transform(vT, it.transform); // [a,b,c,d,e,f]
+    const t = pdfjsLib.Util.transform(vT, it.transform);
     const x = t[4], y = t[5];
     const fontHeight = Math.hypot(t[1], t[3]) || 12;
     const h = fontHeight;
@@ -200,76 +277,74 @@ function layoutWordsFromTextItems(items, viewport) {
   return out;
 }
 
-async function extractTextOverlay(page, scale = 1.6) {
-  const { viewport, ...img } = await pdfToPageImage(page, scale);
-  const text = await page.getTextContent();
-  const items = text.items || [];
-
-  const arabicItems = items.filter((it) => safeIsArabicString(it.str || ""));
-  if (items.length > 0 && arabicItems.length / items.length < 0.2) {
-    return { img, words: [], mode: "none", reason: "embedded-glyphs" };
-  }
-
-  const words = layoutWordsFromTextItems(items, viewport);
-  if (words.length >= 3) return { img, words, mode: "text", reason: "" };
-  return { img, words: [], mode: "none", reason: "no-words" };
+function timeout(ms) {
+  return new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout")), ms));
 }
-
-async function ocrPageViaServerless(base64Image, language = "ara") {
-  const res = await fetch(API_OCR, {
+async function ocrPageViaServerless(base64Image, language = "ara", ms = 20000) {
+  const req = fetch(API_OCR, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ base64Image, language, isOverlayRequired: true }),
   });
-  if (!res.ok) throw new Error("OCR failed");
+  const res = await Promise.race([req, timeout(ms)]);
+  if (!res.ok) throw new Error(`OCR HTTP ${res.status}`);
   return await res.json();
 }
 
-async function translateAPI(text, source = "ar", target = "en") {
-  const r = await fetch(API_TRANSLATE, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ q: text, source, target }),
+// ---------- DOCX helpers ----------
+/** Wrap text nodes with <span class="hr-word" data-word="...">… */
+function wrapDocxWords(container, onHover, onClick, onDblClick) {
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => {
+      const text = node.nodeValue || "";
+      return /\S/.test(text) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
   });
-  if (!r.ok) throw new Error("Translate failed");
-  const j = await r.json();
-  if (typeof j?.translatedText === "string") return j.translatedText;
-  if (Array.isArray(j) && j[0]?.translatedText) return j[0].translatedText;
-  return "";
+
+  const arabicWord = /[\u0600-\u06FF]+/g;
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+
+  nodes.forEach((textNode) => {
+    const text = textNode.nodeValue;
+    const parent = textNode.parentNode;
+    if (!parent) return;
+
+    const frag = document.createDocumentFragment();
+    let lastIndex = 0;
+    text.replace(arabicWord, (match, index) => {
+      // text before the word
+      if (index > lastIndex) {
+        frag.appendChild(document.createTextNode(text.slice(lastIndex, index)));
+      }
+      // the word span
+      const span = document.createElement("span");
+      span.className = "hr-word";
+      span.textContent = match;
+      span.dir = "rtl";
+      span.style.background = "rgba(147,197,253,.06)";
+      span.style.borderRadius = "4px";
+      span.style.cursor = "pointer";
+      span.style.padding = "0 2px";
+      span.addEventListener("mouseenter", (e) => onHover(e, match));
+      span.addEventListener("mousemove", (e) => onHover(e, match));
+      span.addEventListener("mouseleave", () => onHover(null, null));
+      span.addEventListener("click", () => onClick(match));
+      span.addEventListener("dblclick", () => onDblClick(match, span));
+      frag.appendChild(span);
+
+      lastIndex = index + match.length;
+      return match;
+    });
+    // trailing text
+    if (lastIndex < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+    parent.replaceChild(frag, textNode);
+  });
 }
 
-/** return a tooltip string (English) for a single word */
-async function getWordTooltip(arWord, lexicon) {
-  if (!arWord || !arWord.trim()) return "";
-
-  // 1) Try lexicon first
-  const candidates = [
-    arWord,
-    stripDiacritics(arWord),
-    normalizeArabic(arWord),
-    normalizeArabic(stripDiacritics(arWord)),
-  ];
-  for (const c of candidates) {
-    const entry = lexicon[c];
-    if (entry) return (entry.glosses || []).join(", ");
-  }
-
-  // 2) Cache hit?
-  const cached = WORD_CACHE.get(arWord);
-  if (cached) return cached;
-
-  // 3) Call translation API (throttled by cache)
-  try {
-    const en = await translateAPI(arWord, "ar", "en");
-    const tip = en || arWord;
-    WORD_CACHE.set(arWord, tip);
-    return tip;
-  } catch {
-    return arWord; // fallback to Arabic if translation fails
-  }
-}
-
-// ---------- overlay page ----------
+// ---------- Overlay page for PDF ----------
 function PageOverlay({
   img,
   overlay,
@@ -285,26 +360,19 @@ function PageOverlay({
   async function handleEnter(e, w) {
     setPos({ x: e.clientX, y: e.clientY });
     e.currentTarget.style.outline = "2px solid rgba(147,197,253,.9)";
-
     const word = (w.WordText || "").trim();
     if (!word) {
       setHover(null);
       return;
     }
-
     if (lastHoverWord.current === word && hover?.text) {
       setHover({ text: hover.text });
       return;
     }
-
-    // Immediate placeholder while we fetch EN
-    setHover({ text: word });
+    setHover({ text: word }); // placeholder
     lastHoverWord.current = word;
-
     const tip = await getWordTooltip(word, lexicon);
-    if (lastHoverWord.current === word) {
-      setHover({ text: tip });
-    }
+    if (lastHoverWord.current === word) setHover({ text: tip });
   }
 
   function handleLeave(e) {
@@ -342,66 +410,86 @@ function PageOverlay({
           );
         })}
       </div>
-
       {hover && <div style={{ ...STYLES.tip, left: pos.x, top: pos.y }}>{hover.text}</div>}
     </div>
   );
 }
 
-// ---------- main ----------
 export default function App() {
-  const [pages, setPages] = useState([]); // [{img, overlay, mode, reason, boxCount}]
+  const [pages, setPages] = useState([]); // PDF pages [{img, overlay, ...}]
+  const [docxMode, setDocxMode] = useState(false);
   const [activeWord, setActiveWord] = useState(null);
   const [busy, setBusy] = useState(false);
   const [lang, setLang] = useState("ara");
   const [showBoxes, setShowBoxes] = useState(true);
   const [forceOcr, setForceOcr] = useState(false);
   const [testBoxes, setTestBoxes] = useState(false);
+  const [maxPages, setMaxPages] = useState(3); // cap for PDFs
+  const [status, setStatus] = useState("");
+  const [globalError, setGlobalError] = useState("");
+  const [hoverTip, setHoverTip] = useState(null); // for DOCX
   const lexicon = useLexicon();
 
-  async function handleFile(f) {
+  const docxContainerRef = useRef(null);
+
+  async function handleFile(file) {
     setBusy(true);
     setPages([]);
     setActiveWord(null);
+    setHoverTip(null);
+    setGlobalError("");
+    setDocxMode(false);
+    setStatus("Loading…");
+
+    const name = (file?.name || "").toLowerCase();
+    const isPDF = name.endsWith(".pdf") || file.type === "application/pdf";
+    const isDOCX =
+      name.endsWith(".docx") ||
+      file.type ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
     try {
-      const ab = await f.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
+      if (isPDF) {
+        await handlePdf(file);
+      } else if (isDOCX) {
+        await handleDocx(file);
+      } else {
+        throw new Error("Unsupported file type. Please upload PDF or DOCX.");
+      }
+    } catch (e) {
+      setGlobalError(e?.message || String(e));
+    } finally {
+      setBusy(false);
+      setTimeout(() => setStatus(""), 1200);
+    }
+  }
 
-      const out = [];
-      for (let i = 1; i <= pdf.numPages; i++) {
+  // -------- PDF pipeline --------
+  async function handlePdf(f) {
+    const ab = await f.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
+
+    const total = pdf.numPages;
+    const limit = Math.min(total, Math.max(1, Number(maxPages) || 1));
+    const out = [];
+
+    for (let i = 1; i <= limit; i++) {
+      setStatus(`Processing page ${i} of ${limit}…`);
+      let pageMeta = { img: null, overlay: [], mode: "none", reason: "", boxCount: 0 };
+
+      try {
         const page = await pdf.getPage(i);
-
-        // Render page to image
-        const { viewport, ...img } = await (async () => {
-          const vpPage = await pdf.getPage(i);
-          const viewport = vpPage.getViewport({ scale: 1.6 });
-          const canvas = document.createElement("canvas");
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          await vpPage.render({
-            canvasContext: canvas.getContext("2d"),
-            viewport,
-          }).promise;
-          return {
-            dataUrl: canvas.toDataURL("image/jpeg", 0.9),
-            width: canvas.width,
-            height: canvas.height,
-            viewport,
-          };
-        })();
+        const { viewport, ...img } = await pdfToPageImage(page, 1.6);
+        pageMeta.img = { dataUrl: img.dataUrl, width: img.width, height: img.height };
 
         let words = [];
         let mode = "text";
         let reason = "";
 
         if (!forceOcr) {
-          // Try TEXT extraction first
-          const text = await page.getTextContent();
+          const text = await page.getTextContent({ disableCombineTextItems: false });
           const items = text.items || [];
-
-          const arabicItems = items.filter((it) =>
-            safeIsArabicString(it.str || "")
-          );
+          const arabicItems = items.filter((it) => safeIsArabicString(it.str || ""));
           if (items.length > 0 && arabicItems.length / items.length < 0.2) {
             mode = "none";
             reason = "embedded-glyphs";
@@ -417,17 +505,15 @@ export default function App() {
           reason = "forced-ocr";
         }
 
-        // Fallback to OCR when needed
         if (mode !== "text" || words.length === 0) {
+          setStatus(`OCR page ${i}…`);
           try {
-            const ocr = await ocrPageViaServerless(img.dataUrl, lang);
+            const ocr = await ocrPageViaServerless(img.dataUrl, lang, 25000);
             const pr = ocr?.ParsedResults?.[0];
             const ocrWords = [];
             if (pr?.TextOverlay?.Lines) {
               for (const line of pr.TextOverlay.Lines) {
-                const lineText =
-                  line.LineText ||
-                  (line.Words || []).map((w) => w.WordText).join(" ");
+                const lineText = line.LineText || (line.Words || []).map((w) => w.WordText).join(" ");
                 for (const w of line.Words || []) {
                   ocrWords.push({ ...w, lineText });
                 }
@@ -439,17 +525,16 @@ export default function App() {
               reason = "Embedded text wasn’t Unicode Arabic; OCR used.";
             } else if (reason === "forced-ocr") {
               reason = "Force OCR enabled.";
-            } else {
+            } else if (!reason) {
               reason = "No usable text layer; OCR used.";
             }
           } catch (e) {
             words = [];
             mode = "ocr";
-            reason = "OCR error: " + e.message;
+            reason = "OCR error: " + (e?.message || e);
           }
         }
 
-        // DEBUG: synthetic boxes
         if (testBoxes) {
           const synth = [];
           for (let k = 0; k < 6; k++) {
@@ -468,21 +553,61 @@ export default function App() {
           words = words.concat(synth);
         }
 
-        out.push({
-          img: { dataUrl: img.dataUrl, width: img.width, height: img.height },
-          overlay: words,
-          mode,
-          reason,
-          boxCount: words.length,
-        });
+        pageMeta.overlay = words;
+        pageMeta.mode = (mode || "none");
+        pageMeta.reason = reason || "";
+        pageMeta.boxCount = words.length;
+      } catch (e) {
+        pageMeta.error = (e?.message || String(e));
       }
 
-      setPages(out);
-    } catch (e) {
-      alert("Failed to process PDF: " + e.message);
-    } finally {
-      setBusy(false);
+      out.push(pageMeta);
+      setPages((prev) => [...prev, pageMeta]);
     }
+  }
+
+  // -------- DOCX pipeline --------
+  async function handleDocx(file) {
+    setDocxMode(true);
+    setStatus("Rendering DOCX…");
+    const container = docxContainerRef.current;
+    container.innerHTML = ""; // clear
+
+    const arrayBuffer = await file.arrayBuffer();
+    const renderAsync = await loadDocxPreview();
+    await renderAsync(arrayBuffer, container, container, {
+      // docx-preview options
+      ignoreWidth: false,
+      ignoreHeight: false,
+      className: "hr-docx",
+    });
+
+    // Wrap Arabic words with spans to enable hover/click
+    const tipState = { text: "", pos: { x: 0, y: 0 } };
+    const onHover = async (e, word) => {
+      if (!e || !word) {
+        setHoverTip(null);
+        return;
+      }
+      tipState.pos = { x: e.clientX, y: e.clientY };
+      // show immediate placeholder
+      setHoverTip({ text: word, x: tipState.pos.x, y: tipState.pos.y });
+      const gloss = await getWordTooltip(word, lexicon);
+      setHoverTip({ text: gloss || word, x: tipState.pos.x, y: tipState.pos.y });
+    };
+    const onClick = (word) => {
+      setActiveWord({ w: { WordText: word, lineText: "" }, translation: null });
+    };
+    const onDblClick = async (word, span) => {
+      // get containing line text (nearest block)
+      let block = span?.closest("p, div, span");
+      const lineText = (block?.innerText || word).replace(/\s+/g, " ").trim();
+      const translated = await translateAPI(lineText, "ar", "en").catch(() => "");
+      setActiveWord({ w: { WordText: word, lineText }, translation: translated });
+    };
+
+    wrapDocxWords(container, onHover, onClick, onDblClick);
+    setStatus("Done.");
   }
 
   async function translateLine(text, source = "ar", target = "en") {
@@ -494,10 +619,10 @@ export default function App() {
     }
   }
 
-  function onWordClick(w /*, gloss */) {
+  function onWordClickPDF(w) {
     setActiveWord({ w, gloss: null, translation: null });
   }
-  async function onWordDblClick(w) {
+  async function onWordDblClickPDF(w) {
     const translated = await translateLine(w.lineText || w.WordText, "ar", "en");
     setActiveWord((prev) => ({ ...(prev || { w }), translation: translated }));
   }
@@ -523,52 +648,66 @@ export default function App() {
             margin: "0 auto",
             padding: 16,
             display: "grid",
-            gridTemplateColumns: "1fr 320px",
+            gridTemplateColumns: "1fr 380px",
             gap: 16,
           }}
         >
           <div style={STYLES.toolbar}>
             <input
               type="file"
-              accept="application/pdf"
-              onChange={(e) =>
-                e.target.files?.[0] && handleFile(e.target.files[0])
-              }
+              accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
               style={STYLES.input}
             />
-            <select
-              value={lang}
-              onChange={(e) => setLang(e.target.value)}
-              style={STYLES.input}
-            >
-              <option value="ara">Arabic (ara)</option>
-              <option value="eng">English (eng)</option>
-            </select>
-            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input
-                type="checkbox"
-                checked={showBoxes}
-                onChange={(e) => setShowBoxes(e.target.checked)}
-              />
-              Show boxes
-            </label>
-            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input
-                type="checkbox"
-                checked={forceOcr}
-                onChange={(e) => setForceOcr(e.target.checked)}
-              />
-              Force OCR
-            </label>
-            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <input
-                type="checkbox"
-                checked={testBoxes}
-                onChange={(e) => setTestBoxes(e.target.checked)}
-              />
-              Draw test boxes
-            </label>
+            {!docxMode && (
+              <>
+                <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  Max pages:
+                  <input
+                    type="number"
+                    min={1}
+                    value={maxPages}
+                    onChange={(e) => setMaxPages(e.target.value)}
+                    style={{ ...STYLES.input, width: 90 }}
+                  />
+                </label>
+                <select
+                  value={lang}
+                  onChange={(e) => setLang(e.target.value)}
+                  style={STYLES.input}
+                  title="OCR language (for images or non-Unicode PDFs)"
+                >
+                  <option value="ara">Arabic (ara)</option>
+                  <option value="eng">English (eng)</option>
+                </select>
+                <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={showBoxes}
+                    onChange={(e) => setShowBoxes(e.target.checked)}
+                  />
+                  Show boxes
+                </label>
+                <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={forceOcr}
+                    onChange={(e) => setForceOcr(e.target.checked)}
+                  />
+                  Force OCR
+                </label>
+                <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={testBoxes}
+                    onChange={(e) => setTestBoxes(e.target.checked)}
+                  />
+                  Draw test boxes
+                </label>
+              </>
+            )}
             {busy ? <span>Processing…</span> : <span>Ready</span>}
+            {status && <span style={STYLES.badge}>{status}</span>}
           </div>
 
           <div style={STYLES.sidebar}>
@@ -603,6 +742,7 @@ export default function App() {
                 )}
               </div>
             )}
+            {globalError && <div style={STYLES.error}>{globalError}</div>}
           </div>
         </div>
       </div>
@@ -615,34 +755,57 @@ export default function App() {
           margin: "0 auto",
           padding: 16,
           display: "grid",
-          gridTemplateColumns: "1fr 320px",
+          gridTemplateColumns: "1fr 380px",
           gap: 16,
         }}
       >
         <div>
-          {pages.length === 0 && (
+          {!docxMode && pages.length === 0 && (
             <div style={{ opacity: 0.7, marginTop: 40 }}>
-              Upload a PDF to begin.
+              Upload a PDF or DOCX to begin.
+              <div style={{ marginTop: 8, fontSize: 13, color: "#9ca3af" }}>
+                (PDFs are limited to first {maxPages} page{Number(maxPages) > 1 ? "s" : ""} by default.)
+              </div>
             </div>
           )}
-          {pages.map((p, i) => (
-            <div key={i}>
-              <div style={{ color: "#94a3b8", marginTop: 16 }}>
-                Page {i + 1}
-                <span style={STYLES.badge}>mode: {p.mode}</span>
-                <span style={STYLES.badge}>boxes: {p.boxCount}</span>
-                {p.reason && <span style={STYLES.warning}>• {p.reason}</span>}
+
+          {/* PDF rendering */}
+          {!docxMode &&
+            pages.map((p, i) => (
+              <div key={i}>
+                <div style={{ color: "#94a3b8", marginTop: 16 }}>
+                  Page {i + 1}
+                  <span style={STYLES.badge}>mode: {p.mode}</span>
+                  <span style={STYLES.badge}>boxes: {p.boxCount}</span>
+                  {p.reason && <span style={STYLES.warning}>• {p.reason}</span>}
+                </div>
+                {p.error && <div style={STYLES.error}>Error: {p.error}</div>}
+                {p.img ? (
+                  <PageOverlay
+                    img={p.img}
+                    overlay={p.overlay}
+                    lexicon={lexicon}
+                    onWordClick={onWordClickPDF}
+                    onWordDblClick={onWordDblClickPDF}
+                    showBoxes={showBoxes}
+                  />
+                ) : (
+                  <div style={STYLES.error}>Failed to render this page.</div>
+                )}
               </div>
-              <PageOverlay
-                img={p.img}
-                overlay={p.overlay}
-                lexicon={lexicon}
-                onWordClick={onWordClick}
-                onWordDblClick={onWordDblClick}
-                showBoxes={showBoxes}
-              />
+            ))}
+
+          {/* DOCX rendering */}
+          {docxMode && (
+            <div style={STYLES.docxShell}>
+              <div ref={docxContainerRef} style={STYLES.docxPage} dir="rtl" />
+              {hoverTip && (
+                <div style={{ ...STYLES.tip, left: hoverTip.x, top: hoverTip.y }}>
+                  {hoverTip.text}
+                </div>
+              )}
             </div>
-          ))}
+          )}
         </div>
         <div /> {/* spacer */}
       </div>
